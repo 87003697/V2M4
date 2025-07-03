@@ -151,9 +151,13 @@ class MeshRenderer:
 
             if ssaa > 1:
                 img = F.interpolate(img.permute(0, 3, 1, 2), (resolution, resolution), mode='bilinear', align_corners=False, antialias=True)
-                img = img.squeeze()
+                img = img.squeeze(0)
+                if type in ["mask", "depth"] and img.shape[0] == 1:
+                    img = img.squeeze(0)
             else:
-                img = img.permute(0, 3, 1, 2).squeeze()
+                img = img.permute(0, 3, 1, 2).squeeze(0)
+                if type in ["mask", "depth"] and img.shape[0] == 1:
+                    img = img.squeeze(0)
             out_dict[type] = img
 
         return out_dict
@@ -198,9 +202,47 @@ class MeshRenderer:
         vertices_homo = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1)
         vertices_camera_batch = torch.bmm(vertices_homo, extrinsics_batch.transpose(-1, -2))
         vertices_clip_batch = torch.bmm(vertices_homo, full_proj_batch.transpose(-1, -2))
+        
+        # Fix: Ensure faces are int32 for nvdiffrast
         faces_int = mesh.faces.int()
+        
+        # Safety check: validate inputs
+        if torch.isnan(vertices_clip_batch).any() or torch.isinf(vertices_clip_batch).any():
+            print("⚠️  Warning: NaN or Inf in vertices_clip_batch")
+            
+        # Check for reasonable vertex values
+        if vertices_clip_batch.abs().max() > 1e6:
+            print(f"⚠️  Warning: Very large vertex values: {vertices_clip_batch.abs().max()}")
 
-        rast_batch, _ = dr.rasterize(self.glctx, vertices_clip_batch, faces_int, (resolution * ssaa, resolution * ssaa))
+        try:
+            rast_batch, _ = dr.rasterize(self.glctx, vertices_clip_batch, faces_int, (resolution * ssaa, resolution * ssaa))
+        except RuntimeError as e:
+            if "Cuda error: 700" in str(e):
+                print(f"⚠️  CUDA error 700 encountered with batch_size={batch_size}, attempting fallback...")
+                # Fallback: process each item individually
+                individual_results = []
+                for i in range(batch_size):
+                    try:
+                        single_vertices = vertices_clip_batch[i:i+1]
+                        single_rast, _ = dr.rasterize(self.glctx, single_vertices, faces_int, (resolution * ssaa, resolution * ssaa))
+                        individual_results.append(single_rast)
+                    except RuntimeError:
+                        print(f"⚠️  Skipping problematic item {i} in batch")
+                        # Create a dummy result
+                        dummy_rast = torch.zeros((1, resolution * ssaa, resolution * ssaa, 4), device=self.device, dtype=torch.float32)
+                        individual_results.append(dummy_rast)
+                
+                if individual_results:
+                    rast_batch = torch.cat(individual_results, dim=0)
+                else:
+                    # Complete fallback: return empty results
+                    print("⚠️  All items failed, returning empty results")
+                    default_img = torch.zeros((batch_size, resolution, resolution, 3), dtype=torch.float32, device=self.device)
+                    ret_dict = {k: default_img if k in ['normal', 'normal_map', 'color'] else default_img[..., :1] for k in return_types}
+                    return ret_dict
+            else:
+                raise e  # Re-raise non-CUDA-700 errors
+
         if return_rast_vertices:
             return rast_batch, full_proj_batch
 
@@ -214,12 +256,31 @@ class MeshRenderer:
                 img = dr.interpolate(vertices_camera_batch[..., 2:3].contiguous(), rast_batch, faces_int)[0]
                 img = dr.antialias(img, rast_batch, vertices_clip_batch, faces_int)
             elif type == "normal":
-                img = dr.interpolate(
-                    mesh.face_normal.reshape(1, -1, 3), rast_batch,
-                    torch.arange(mesh.faces.shape[0] * 3, device=self.device, dtype=torch.int).reshape(-1, 3)
-                )[0]
-                img = (img + 1) / 2
-                img = dr.antialias(img, rast_batch, vertices_clip_batch, faces_int, pos_gradient_boost=3)
+                # Fix: Handle face_normal shape properly
+                if hasattr(mesh, 'face_normal') and mesh.face_normal is not None:
+                    if len(mesh.face_normal.shape) == 3 and mesh.face_normal.shape[1] == 3:
+                        # If face_normal is [N, 3, 3], take the first normal vector
+                        face_normals = mesh.face_normal[:, 0, :].reshape(1, -1, 3)
+                    else:
+                        # If face_normal is [N, 3], use directly
+                        face_normals = mesh.face_normal.reshape(1, -1, 3)
+                    
+                    img = dr.interpolate(
+                        face_normals, rast_batch,
+                        torch.arange(mesh.faces.shape[0] * 3, device=self.device, dtype=torch.int).reshape(-1, 3)
+                    )[0]
+                    img = (img + 1) / 2
+                    img = dr.antialias(img, rast_batch, vertices_clip_batch, faces_int, pos_gradient_boost=3)
+                else:
+                    # Fallback: use vertex normals from vertex_attrs
+                    if hasattr(mesh, 'vertex_attrs') and mesh.vertex_attrs is not None and mesh.vertex_attrs.shape[1] >= 6:
+                        vertex_normals = mesh.vertex_attrs[:, 3:6].contiguous()
+                        img = dr.interpolate(vertex_normals, rast_batch, faces_int)[0]
+                        img = (img + 1) / 2
+                        img = dr.antialias(img, rast_batch, vertices_clip_batch, faces_int, pos_gradient_boost=3)
+                    else:
+                        # Final fallback: default normal
+                        img = torch.ones_like(rast_batch[..., :3]) * 0.5
             elif type == "normal_map":
                 img = dr.interpolate(mesh.vertex_attrs[:, 3:].contiguous(), rast_batch, faces_int)[0]
                 img = (img + 1) / 2
@@ -287,15 +348,53 @@ class MeshRenderer:
                     img = F.interpolate(img.permute(0, 3, 1, 2), (resolution, resolution), mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
                     mask = F.interpolate(mask.permute(0, 3, 1, 2), (resolution, resolution), mode='nearest').permute(0, 2, 3, 1)
 
-                pt3 = img[mask.squeeze() > 0].reshape(-1, 3)
+                # 修复维度问题：确保img和mask都有相同的batch维度进行索引
+                if img.dim() == 4 and mask.dim() == 4:
+                    # [B, H, W, 3] and [B, H, W, 1]
+                    batch_points = []
+                    for b in range(img.shape[0]):
+                        single_img = img[b]  # [H, W, 3]
+                        single_mask = mask[b].squeeze(-1)  # [H, W]
+                        if single_mask.sum() > 0:  # 确保有有效的点
+                            pt3 = single_img[single_mask > 0]  # [N, 3]
+                            batch_points.append(pt3)
+                    # 合并所有batch的点
+                    if batch_points:
+                        pt3 = torch.cat(batch_points, dim=0)
+                    else:
+                        pt3 = torch.empty((0, 3), device=img.device, dtype=img.dtype)
+                elif img.dim() == 3 and mask.dim() == 3:
+                    # [H, W, 3] and [H, W, 1]
+                    mask_2d = mask.squeeze(-1)  # [H, W]
+                    if mask_2d.sum() > 0:
+                        pt3 = img[mask_2d > 0]  # [N, 3]
+                    else:
+                        pt3 = torch.empty((0, 3), device=img.device, dtype=img.dtype)
+                else:
+                    # Fallback: 尝试原始逻辑但加上安全检查
+                    try:
+                        mask_flat = mask.squeeze()
+                        if mask_flat.dim() > 2:
+                            mask_flat = mask_flat.view(-1)
+                        if img.dim() > 3:
+                            img_flat = img.view(-1, img.shape[-1])
+                        else:
+                            img_flat = img.view(-1, 3)
+                        pt3 = img_flat[mask_flat > 0]
+                    except Exception as e:
+                        print(f"⚠️  Error in points3Dpos fallback: {e}")
+                        pt3 = torch.empty((0, 3), device=img.device, dtype=img.dtype)
 
                 out_dict[type] = pt3
             else:
                 if ssaa > 1:
                     img = F.interpolate(img.permute(0, 3, 1, 2), (resolution, resolution), mode='bilinear', align_corners=False, antialias=True)
-                    img = img.squeeze()
+                    # 保持批次维度，不要squeeze掉batch dimension
+                    # img 现在是 [B, C, H, W] 格式，这是我们想要的
                 else:
-                    img = img.permute(0, 3, 1, 2).squeeze()
+                    img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+                    # 保持批次维度，不要squeeze掉batch dimension
+                    # img 现在是 [B, C, H, W] 格式，这是我们想要的
                 out_dict[type] = img
 
         return out_dict

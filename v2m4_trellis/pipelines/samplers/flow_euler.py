@@ -197,10 +197,44 @@ class FlowEulerSampler(Sampler):
                     gradient_img_mesh, params = render_utils.find_closet_camera_pos(ret_mesh[0], refer_image, params=camera_params, return_optimize=True)
                     gradient_img_gs, params = render_utils.find_closet_camera_pos(ret_gaussian[0], refer_image, params=camera_params, return_optimize=True)
 
-                    loss_mesh = dreamsim_model(F.interpolate((gradient_img_mesh * mask).unsqueeze(0), (224, 224), mode='bicubic'), F.interpolate(refer_image.unsqueeze(0), (224, 224), mode='bicubic')) + loss1(gradient_img_mesh * mask, refer_image) + loss2(gradient_img_mesh * mask, refer_image)
-                    # loss_mesh = loss1(gradient_img_mesh, refer_image) + loss2(gradient_img_mesh, refer_image)
-                    loss_gs = dreamsim_model(F.interpolate((gradient_img_gs * mask).unsqueeze(0), (224, 224), mode='bicubic'), F.interpolate(refer_image.unsqueeze(0), (224, 224), mode='bicubic')) + loss1(gradient_img_gs * mask, refer_image) + loss2(gradient_img_gs * mask, refer_image)
-                    # loss_gs = loss1(gradient_img_gs, refer_image) + loss2(gradient_img_gs, refer_image)
+                    # Ensure both images have the same size for loss computation
+                    if gradient_img_mesh.shape != refer_image.shape:
+                        # Resize to common size (512x512)
+                        # gradient_img_mesh and refer_image are in [3, H, W] format
+                        target_size = 512
+                        if gradient_img_mesh.shape[-1] != target_size:
+                            # gradient_img_mesh is [3, H, W], need to add batch dim for interpolate
+                            gradient_img_mesh = F.interpolate(gradient_img_mesh.unsqueeze(0), (target_size, target_size), mode='bilinear', align_corners=False).squeeze(0)
+                        if refer_image.shape[-1] != target_size:
+                            # refer_image is [3, H, W], need to add batch dim for interpolate  
+                            refer_image_resized = F.interpolate(refer_image.unsqueeze(0), (target_size, target_size), mode='bilinear', align_corners=False).squeeze(0)
+                            # Update mask accordingly - ensure it maintains [H, W] shape
+                            mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0), (target_size, target_size), mode='nearest').squeeze(0).squeeze(0)
+                        else:
+                            refer_image_resized = refer_image
+                    else:
+                        refer_image_resized = refer_image
+                    
+                    # Ensure same size for gs image as well
+                    if gradient_img_gs.shape != refer_image_resized.shape:
+                        if gradient_img_gs.shape[-1] != target_size:
+                            # gradient_img_gs is [3, H, W], need to add batch dim for interpolate
+                            gradient_img_gs = F.interpolate(gradient_img_gs.unsqueeze(0), (target_size, target_size), mode='bilinear', align_corners=False).squeeze(0)
+
+                    # Ensure mask broadcasting works correctly
+                    # gradient_img_mesh: [3, H, W], mask: [H, W] -> gradient_img_mesh * mask: [3, H, W]
+                    masked_gradient_mesh = gradient_img_mesh * mask  # Broadcasting: [3, H, W] * [H, W] -> [3, H, W]
+                    masked_gradient_gs = gradient_img_gs * mask      # Broadcasting: [3, H, W] * [H, W] -> [3, H, W]
+
+                    # For dreamsim_model, inputs should be [N, C, H, W] format
+                    # Add batch dimension: [3, H, W] -> [1, 3, H, W]
+                    input_mesh = F.interpolate(masked_gradient_mesh.unsqueeze(0), (224, 224), mode='bicubic')
+                    input_refer = F.interpolate(refer_image_resized.unsqueeze(0), (224, 224), mode='bicubic')
+                    
+                    loss_mesh = dreamsim_model(input_mesh, input_refer) + loss1(masked_gradient_mesh, refer_image_resized) + loss2(masked_gradient_mesh, refer_image_resized)
+                    
+                    input_gs = F.interpolate(masked_gradient_gs.unsqueeze(0), (224, 224), mode='bicubic')
+                    loss_gs = dreamsim_model(input_gs, input_refer) + loss1(masked_gradient_gs, refer_image_resized) + loss2(masked_gradient_gs, refer_image_resized)
                     loss_reg = 0.2 * loss1(neg_cond, orig_features) # small regularization term to avoid not optimized negative tensor
                     loss = loss_mesh + loss_gs + loss_reg
                     loss.backward()

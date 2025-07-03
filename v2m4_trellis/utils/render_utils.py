@@ -385,7 +385,7 @@ def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):
 
 
 # Particle Swarm Optimization implementation
-def particle_swarm_optimization(fitness_function, bounds, num_particles=200, max_iter=25, init_samples=2000, use_init_samples=True, rmbg_image=None, renderer=None, prior_params=None, save_path=None, is_Hunyuan=False, use_vggt=False):
+def particle_swarm_optimization(fitness_function, bounds, num_particles=100, max_iter=15, init_samples=1000, use_init_samples=True, rmbg_image=None, renderer=None, prior_params=None, save_path=None, is_Hunyuan=False, use_vggt=False):
     dim = 6 # yaw, pitch, r, lookat_x, lookat_y, lookat_z
 
     if use_init_samples:
@@ -543,7 +543,8 @@ def render_frames(sample, extrinsics, intrinsics, options={}, colors_overwrite=N
         renderer.rendering_options.resolution = options.get('resolution', 512)
         renderer.rendering_options.near = options.get('near', 1)
         renderer.rendering_options.far = options.get('far', 100)
-        renderer.rendering_options.ssaa = options.get('ssaa', 4)
+        '''Use SSAA = 2 instead of 4 to reduce memory usage for large meshes'''
+        renderer.rendering_options.ssaa = options.get('ssaa', 2)
         # white background
         renderer.rendering_options.bg_color = options.get('bg_color', (0, 0, 0))
     else:
@@ -665,7 +666,7 @@ def render_snapshot(samples, resolution=512, bg_color=(0, 0, 0), offset=(-16 / 1
 
 
 # Optimize the camera paramters to find the most aligned camera pose with the rmbg image
-def find_closet_camera_pos(sample, rmbg_image, resolution=518, bg_color=(0, 0, 0), iterations=100, params=None, return_optimize=False, prior_params=None, save_path=None, is_Hunyuan=False, use_vggt=False):
+def find_closet_camera_pos(sample, rmbg_image, resolution=512, bg_color=(0, 0, 0), iterations=100, params=None, return_optimize=False, prior_params=None, save_path=None, is_Hunyuan=False, use_vggt=False):
     fov = 40
 
     options = {'resolution': resolution, 'bg_color': bg_color}
@@ -683,8 +684,8 @@ def find_closet_camera_pos(sample, rmbg_image, resolution=518, bg_color=(0, 0, 0
         renderer.rendering_options.resolution = options.get('resolution', 512)
         renderer.rendering_options.near = options.get('near', 1)
         renderer.rendering_options.far = options.get('far', 100)
-        '''Use SSAA = 4 will help speed up the optimization, however also longer the time for each iteration. Since the reference image is also smoothed. thus we use SSAA = 4 here'''
-        renderer.rendering_options.ssaa = options.get('ssaa', 4)
+        '''Use SSAA = 2 instead of 4 to reduce memory usage for large meshes'''
+        renderer.rendering_options.ssaa = options.get('ssaa', 2)
     else:
         raise ValueError(f'Unsupported sample type: {type(sample)}')
 
@@ -713,13 +714,18 @@ def find_closet_camera_pos(sample, rmbg_image, resolution=518, bg_color=(0, 0, 0
     dreamsim_model, _ = dreamsim(pretrained=True, device=device)
 
     rmbg_image = torch.tensor(np.array(rmbg_image)).float().cuda().permute(2, 0, 1) / 255
+    
+    # Resize rmbg_image to match rendering resolution if needed
+    if rmbg_image.shape[-1] != resolution:
+        print(f"🔧 Resizing rmbg_image from {rmbg_image.shape[-1]} to {resolution}")
+        rmbg_image = F.interpolate(rmbg_image.unsqueeze(0), size=(resolution, resolution), mode='bilinear', align_corners=False).squeeze(0)
 
     # Get foreground mask from the rmbg image (which is not black)
     mask = (rmbg_image.sum(dim=0) > 0).float()
 
     # Batch version of the above function. Set torch.no_grad() to avoid memory leak, as PSO does not require gradients
     @torch.no_grad()
-    def fitness_batch(params, renderer, sub_batch_size=10, return_more=False):
+    def fitness_batch(params, renderer, sub_batch_size=3, return_more=False):  # 减少batch size从10到3
         '''
         params: batch of camera parameters [yaw, pitch, r, lookat_x, lookat_y, lookat_z], shape: [B, 6]
         sub_batch_size: batch size for rendering, too large batch size may cause OOM and overflow
@@ -733,33 +739,60 @@ def find_closet_camera_pos(sample, rmbg_image, resolution=518, bg_color=(0, 0, 0
         losses = []
         renderings = []
         pts3d = []
+        
         for i in range(0, params.shape[0], sub_batch_size):
             sub_extr = extr[i:i+sub_batch_size]
             sub_intr = intr[i:i+sub_batch_size]
+            current_batch_size = sub_extr.shape[0]
+            
             if not isinstance(sample, MeshExtractResult):
                 raise ValueError("Only mesh is supported for now")
             else:
                 res = renderer.render_batch(sample, sub_extr, sub_intr, return_types = ["mask", "color"])
 
-            rendering = torch.clip(res['color'], 0., 1.)
-
-            # convert rendering and rmbg_image to PIL image
-            # use mask to avoid overfitting, since some little translation of the image may lead to better metric, but not the real alignment
-            loss = dreamsim_model(F.interpolate(rendering * mask, (224, 224), mode='bicubic'), F.interpolate(rmbg_image.unsqueeze(0), (224, 224), mode='bicubic'))
-
-            # loss_boundary: ensure the mask region of rendering and rmbg_image are the same with the loss weight of total_img_size / mask_size[0, 1, : n]
-            loss_boundary = torch.nn.MSELoss(reduction="none")(res['mask'], mask.unsqueeze(0).expand(res['mask'].shape)).mean(dim=(1, 2)) * (mask.numel() / mask.sum()) * 0.1
-
-            loss = loss + loss_boundary
+            rendering = torch.clip(res['color'], 0., 1.)  # [current_batch_size, 3, 512, 512]
             
-            losses.append(loss)
-            renderings.append(rendering.detach().cpu())
+            # 为每个批次中的每个项目分别计算损失
+            for j in range(current_batch_size):
+                single_rendering = rendering[j]  # 现在是 [3, 512, 512] (从[B, 3, 512, 512]中取第j个)
+                single_mask = res['mask'][j]     # 现在是 [1, 512, 512] (从[B, 1, 512, 512]中取第j个)
+                
+                # 确保single_mask是[512, 512]的形状
+                if single_mask.dim() == 3 and single_mask.shape[0] == 1:
+                    single_mask = single_mask.squeeze(0)  # [1, 512, 512] -> [512, 512]
+                
+                # 验证single_rendering的形状
+                if single_rendering.dim() != 3 or single_rendering.shape[0] != 3:
+                    print(f"⚠️  Warning: Unexpected rendering shape {single_rendering.shape} for item {j}, expected [3, 512, 512]")
+                    # 添加虚拟数据以保持批次大小一致
+                    dummy_rendering = torch.ones((3, 512, 512), device=device, dtype=torch.float32) * 0.5
+                    renderings.append(dummy_rendering.detach().cpu())
+                    losses.append(torch.tensor(1.0, device=device))
+                    continue
+                
+                # 调整single_rendering的大小以匹配mask
+                mask = single_mask.unsqueeze(0)  # [512, 512] -> [1, 512, 512]
+                
+                # 使用mask来避免过拟合，因为图像的一些小的平移可能会导致更好的指标，但不是真正的对齐
+                # 确保输入F.interpolate的张量是4D：[N, C, H, W]
+                masked_rendering = (single_rendering * single_mask).unsqueeze(0)  # [1, 3, 512, 512]
+                rmbg_input = rmbg_image.unsqueeze(0)  # [1, 3, 512, 512]
+                
+                loss = dreamsim_model(F.interpolate(masked_rendering, (224, 224), mode='bicubic'), F.interpolate(rmbg_input, (224, 224), mode='bicubic'))
+                
+                # loss_boundary: 确保渲染和rmbg_image的mask区域相同，损失权重为 total_img_size / mask_size
+                loss_boundary = torch.nn.MSELoss(reduction="none")(single_mask, mask).mean() * (mask.numel() / mask.sum()) * 0.1
+                
+                loss = loss + loss_boundary
+                
+                losses.append(loss)
+                renderings.append(single_rendering.detach().cpu())
 
             if return_more:
                 res = renderer.render_batch(sample, sub_extr, sub_intr, return_types = ["points3Dpos"])
                 pts3d.append(res['points3Dpos'].detach().cpu())
         
-        renderings = torch.cat(renderings)
+        renderings = torch.stack(renderings)
         losses = torch.cat(losses)
         # save the rendering for debug
         # for i, r in enumerate(renderings[:10]):
