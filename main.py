@@ -1,4 +1,18 @@
 import os
+import sys
+import cv2
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import argparse
+import imageio
+import trimesh
+from PIL import Image
+from datetime import datetime
+import gc
+from natsort import natsorted, ns
 # os.environ['ATTN_BACKEND'] = 'xformers'   # Can be 'flash-attn' or 'xformers', default is 'flash-attn'
 os.environ['SPCONV_ALGO'] = 'native'        # Can be 'native' or 'auto', default is 'auto'.
                                             # 'auto' is faster but will do benchmarking at the beginning.
@@ -266,6 +280,19 @@ def get_folder_size(folder):
     """Returns the number of image files in the given folder."""
     return len([f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))])
 
+def log_progress(message):
+    """Helper function to print progress with timestamp"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}")
+    sys.stdout.flush()
+
+def log_memory_usage():
+    """Log current GPU memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        cached = torch.cuda.memory_reserved() / 1024**3  # GB
+        print(f"GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -303,29 +330,44 @@ if __name__ == "__main__":
     assigned_animations = assignments[args.n]
 
     print(f"Process {args.n} assigned {len(assigned_animations)} folders with total images: {sum(get_folder_size(f) for f in assigned_animations)}")
+    log_progress(f"Starting to process {len(assigned_animations)} animation folders")
+    log_progress(f"Assigned folders: {assigned_animations}")
 
     # Load a pipeline from a model folder or a Hugging Face model hub.
+    log_progress(f"Loading {args.model} model pipeline...")
     if args.model == "TRELLIS":
+        log_progress("Loading TRELLIS pipeline...")
         pipeline = TrellisImageTo3DPipeline.from_pretrained("JeffreyXiang/TRELLIS-image-large")
         pipeline.cuda()
+        log_progress("TRELLIS pipeline loaded successfully")
     elif args.model == "Hunyuan":
+        log_progress("Loading Hunyuan3D pipeline...")
         pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained('tencent/Hunyuan3D-2')
         pipeline_paint = Hunyuan3DPaintPipeline.from_pretrained('tencent/Hunyuan3D-2')
+        log_progress("Hunyuan3D pipeline loaded successfully")
     elif args.model == "TripoSG" or args.model == "Craftsman":
+        log_progress(f"Loading {args.model} components...")
         checkpoints_dir = "./models/checkpoints/"
 
         if args.model == "TripoSG":
+            log_progress("Loading TripoSG RMBG model...")
             RMBG_PRETRAINED_MODEL = f"{checkpoints_dir}/RMBG-1.4"
 
             pipeline_rmbg_net = BriaRMBG.from_pretrained(RMBG_PRETRAINED_MODEL).to("cuda")
             pipeline_rmbg_net.eval()
+            log_progress("TripoSG RMBG model loaded")
 
+            log_progress("Loading TripoSG main pipeline...")
             TRIPOSG_PRETRAINED_MODEL = f"{checkpoints_dir}/TripoSG"
             pipeline_triposg_pipe = TripoSGPipeline.from_pretrained(TRIPOSG_PRETRAINED_MODEL).to("cuda", torch.float16)
+            log_progress("TripoSG main pipeline loaded")
         elif args.model == "Craftsman":
+            log_progress("Loading Craftsman pipeline...")
             checkpoints_dir_CraftsMan = f"/{checkpoints_dir}/craftsman-DoraVAE"
             pipeline_crafts = CraftsManPipeline.from_pretrained(checkpoints_dir_CraftsMan, device="cuda", torch_dtype=torch.bfloat16) # bf16 for fast inference
+            log_progress("Craftsman pipeline loaded")
 
+        log_progress("Loading MV-Adapter pipeline...")
         pipeline_mv_adapter_pipe = prepare_pipeline(
             base_model="stabilityai/stable-diffusion-xl-base-1.0",
             vae_model="madebyollin/sdxl-vae-fp16-fix",
@@ -337,12 +379,15 @@ if __name__ == "__main__":
             device="cuda",
             dtype=torch.float16,
         )
+        log_progress("MV-Adapter pipeline loaded")
 
+        log_progress("Loading Texture pipeline...")
         pipeline_texture = TexturePipeline(
             upscaler_ckpt_path=f"{checkpoints_dir}/RealESRGAN_x2plus.pth",
             inpaint_ckpt_path=f"{checkpoints_dir}/big-lama.pt",
             device="cuda",
         )
+        log_progress("Texture pipeline loaded")
 
         mod_config = ModProcessConfig(view_upscale=True, inpaint_mode="view")
 
@@ -369,6 +414,9 @@ if __name__ == "__main__":
         output_path = os.path.join(default_output_root if args.output == "" else args.output, animation.split("/")[-1])
 
         print("/n/n ============= Start processing: ", animation, " =============/n")
+        log_progress(f"🎬 Starting animation: {animation}")
+        log_progress(f"📁 Output path: {output_path}")
+        log_memory_usage()
 
         # New folder for the output
         os.makedirs(output_path, exist_ok=True)
@@ -376,11 +424,13 @@ if __name__ == "__main__":
         # Fix the seed for reproducibility
         seed = args.seed
         seed_torch(seed)
+        log_progress(f"🎲 Seed set to: {seed}")
             
         imgs_list = os.listdir(source_path)
         # exclude folders
         imgs_list = [img for img in imgs_list if not os.path.isdir(source_path + "/" + img)]
         imgs_list = natsorted(imgs_list, alg=ns.PATH)
+        log_progress(f"📸 Found {len(imgs_list)} images in {source_path}")
 
         existing_outputs = os.listdir(output_path)
         # exclude folders
@@ -392,40 +442,57 @@ if __name__ == "__main__":
         extrinsics_list = []
         visual_list = []
         params = None
+        
+        total_frames_to_process = len([img for ind, img in enumerate(imgs_list) if not args.baseline and (ind % args.skip == 0 or ind == len(imgs_list) - 1)]) if not args.baseline else len(imgs_list)
+        log_progress(f"🔄 Will process {total_frames_to_process} frames (skip={args.skip}, baseline={args.baseline})")
+        
         for ind, img in enumerate(imgs_list):            
             # Skip every N frames for large movement of the object
             if not args.baseline and ind % args.skip != 0 and ind != len(imgs_list) - 1:
                 continue
 
+            log_progress(f"🖼️  Processing frame {ind+1}/{len(imgs_list)}: {img}")
+            start_time = time.time()
+
             # Load an image
             image = Image.open(source_path + "/" + img)
+            log_progress(f"📥 Loaded image: {image.size}")
 
             # Get base name of the image
             base_name = image.filename.split("/")[-1].split(".")[0]
 
+            log_progress("🧊 Starting 3D Mesh Generation...")
             "======================= 3D Mesh Generation per video frame ======================="
             # Run the pipeline
             if args.model == "TRELLIS":
+                log_progress("🚀 Running TRELLIS pipeline...")
                 rmbg_image, outputs, slat, coords, cond = pipeline.run(
                     image,
                     # Optional parameters
                     seed=seed,
                     save_path=output_path + "/" + base_name + "_rmbg.png",
                 )
+                log_progress("✅ TRELLIS pipeline completed")
             elif args.model == "Hunyuan":
+                log_progress("🚀 Running Hunyuan3D pipeline...")
                 save_path = output_path + "/" + base_name + "_rmbg.png"
                 cropped_image, rmbg_image = TrellisImageTo3DPipeline.preprocess_image(image, return_rgba=True)
                 rmbg_image.save(save_path)
                 cropped_image.save(save_path.replace(".png", "_cropped.png"))
+                log_progress("📸 Image preprocessing completed")
 
                 torch.manual_seed(seed)
+                log_progress("🏗️  Generating 3D mesh...")
                 mesh = pipeline(image=cropped_image)[0]
+                log_progress("✅ 3D mesh generated")
 
+                log_progress("🧹 Cleaning mesh...")
                 for cleaner in [FloaterRemover(), DegenerateFaceRemover()]:
                     mesh = cleaner(mesh)
 
                 # more facenum, more cost time. The distribution median is ~15000
                 mesh = FaceReducer()(mesh, max_facenum=20000)
+                log_progress("✅ Mesh cleaning completed")
 
                 # since in Hunyuan2.0 texture paint, they use xatlas to generate the texture, which may destroy the watertightness. Thus save the attributes of the mesh before painting.
                 vertices_watertight = mesh.vertices @ np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
@@ -433,7 +500,9 @@ if __name__ == "__main__":
                 mean_point = mesh.vertices.mean(axis=0)
                 vertices_watertight = (vertices_watertight - mean_point) * 0.5 + mean_point
 
+                log_progress("🎨 Starting texture painting...")
                 mesh = pipeline_paint(mesh, image=cropped_image)
+                log_progress("✅ Texture painting completed")
 
                 # rotate mesh (from y-up to z-up) and scale it to half size to align with the TRELLIS
                 mesh.vertices = mesh.vertices @ np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
@@ -456,6 +525,7 @@ if __name__ == "__main__":
                 vertices = vertices_watertight.astype(np.float32)
                 faces = faces_watertight.astype(np.int64)
                 # bake texture
+                log_progress("🔥 Baking texture...")
                 observations, extrinsics, intrinsics = render_utils.render_multiview(outputs['mesh_genTex'][0], resolution=1024, nviews=300)
                 masks = [np.any(observation > 0, axis=-1) for observation in observations]
                 extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
@@ -474,20 +544,28 @@ if __name__ == "__main__":
                     vertex_attrs=torch.cat([torch.tensor(mesh.visual.vertex_colors[..., :3], dtype=torch.float32).cuda() / 255, torch.from_numpy(mesh.vertex_normals).float().cuda()], dim=-1),
                     res=512
                 )
+                log_progress("✅ Hunyuan3D pipeline completed")
             elif args.model == "TripoSG" or args.model == "Craftsman":
+                log_progress(f"🚀 Running {args.model} pipeline...")
                 save_path = output_path + "/" + base_name + "_rmbg.png"
                 _, rmbg_image_rgba, rmbg_image = TrellisImageTo3DPipeline.preprocess_image(image, return_all_rbga=True)
                 rmbg_image.save(save_path)
+                log_progress("📸 Image preprocessing completed")
 
                 torch.manual_seed(seed)
 
                 if args.model == "TripoSG":
+                    log_progress("🏗️  Running TripoSG full pipeline...")
                     vertices, faces, mesh = tripoSG_app.run_full(source_path + "/" + img, rmbg_image_rgba, pipeline_rmbg_net, pipeline_triposg_pipe, pipeline_mv_adapter_pipe, True, seed, pipeline_texture, mod_config)
+                    log_progress("✅ TripoSG full pipeline completed")
                 elif args.model == "Craftsman":
+                    log_progress("🏗️  Running Craftsman full pipeline...")
                     vertices, faces, mesh = craftsman_app.run_full(source_path + "/" + img, rmbg_image_rgba, pipeline_crafts, pipeline_mv_adapter_pipe, True, seed, pipeline_texture, mod_config)
+                    log_progress("✅ Craftsman full pipeline completed")
 
                 outputs = {'mesh': [None], 'mesh_genTex': [None]}
 
+                log_progress("🔧 Creating mesh result structures...")
                 outputs['mesh_genTex'][0] = MeshExtractResult(
                     vertices=torch.tensor(mesh.vertices, dtype=torch.float32).cuda(),
                     faces=torch.tensor(mesh.faces, dtype=torch.int64).cuda(),
@@ -498,6 +576,7 @@ if __name__ == "__main__":
                 )
 
                 # bake texture
+                log_progress("🔥 Baking texture...")
                 observations, extrinsics, intrinsics = render_utils.render_multiview(outputs['mesh_genTex'][0], resolution=1024, nviews=300)
                 masks = [np.any(observation > 0, axis=-1) for observation in observations]
                 extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
@@ -516,8 +595,14 @@ if __name__ == "__main__":
                     vertex_attrs=torch.cat([torch.tensor(mesh.visual.vertex_colors[..., :3], dtype=torch.float32).cuda() / 255, torch.from_numpy(mesh.vertex_normals).float().cuda()], dim=-1),
                     res=512
                 )
+                log_progress(f"✅ {args.model} pipeline completed")
+
+            frame_time = time.time() - start_time
+            log_progress(f"⏱️  Frame {ind+1} completed in {frame_time:.2f} seconds")
+            log_memory_usage()
 
             if args.baseline:
+                log_progress("📤 Exporting baseline result...")
                 if args.model == "TRELLIS":
                     render_video_and_glbs(outputs, base_name + "_baseline", output_path)
                     continue
@@ -526,10 +611,12 @@ if __name__ == "__main__":
                     mesh = outputs['mesh_genTex'][0]
                     mesh = trimesh.Trimesh(vertices=mesh.vertices.cpu().numpy() @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]), faces=mesh.faces.cpu().numpy(), visual=trimesh.visual.TextureVisuals(uv=mesh.uv.cpu().numpy(), image=Image.fromarray((mesh.texture.cpu().numpy() * 255).astype(np.uint8))), process=False)
                     mesh.export(output_path + "/" + base_name + "_baseline" + "_sample.glb")
+                    log_progress("✅ Baseline result exported")
                     continue
 
             "============================================================"
 
+            log_progress("📷 Starting Camera Search and Mesh Re-Pose...")
             "======== Section 4.1 - Camera Search and Mesh Re-Pose ========"
             rend_img, params = render_utils.find_closet_camera_pos(outputs['mesh'][0], rmbg_image, save_path=output_path + "/" + base_name, is_Hunyuan=(args.model == "Hunyuan" or args.model == "TripoSG"), use_vggt=args.use_vggt)  # Craftsman is similar to TRELLIS canonical pose
             imageio.imsave(output_path + "/" + base_name + "_sample_mesh_align.png", rend_img, prior_params=params)
@@ -539,6 +626,7 @@ if __name__ == "__main__":
             else:
                 rend_img, params = render_utils.find_closet_camera_pos(outputs['mesh_genTex'][0], rmbg_image, params=params, use_vggt=args.use_vggt)
                 imageio.imsave(output_path + "/" + base_name + "_sample_genTex_align.png", rend_img)
+            log_progress("✅ Camera search and mesh re-pose completed")
             "============================================================"
 
             "======== Section 4.2 - Mesh Appearance Refinement via Negative Condition Embedding Optimization ========"
