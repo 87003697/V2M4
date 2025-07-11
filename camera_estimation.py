@@ -16,8 +16,8 @@ from typing import Dict, List, Optional
 from v2m4_trellis.utils import render_utils
 from v2m4_trellis.utils.general_utils import *
 # 导入新的可视化模块和预处理管道
-from utils.visualization import CameraEstimationVisualizer
-from utils.loss_objective import create_loss_objective
+from modules.visualization import CameraEstimationVisualizer
+from modules.loss_objective import create_loss_objective
 from v2m4_trellis.pipelines import TrellisImageTo3DPipeline
 
 import sys
@@ -30,7 +30,7 @@ from v2m4_trellis.representations.mesh import MeshExtractResult
 # from rembg import remove, new_session
 
 # Import our custom loss objectives
-from utils.loss_objective import create_loss_objective, list_loss_objectives
+from modules.loss_objective import create_loss_objective, list_loss_objectives
 
 def log_progress(message):
     """Helper function to print progress with timestamp"""
