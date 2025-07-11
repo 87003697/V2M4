@@ -408,7 +408,6 @@ def particle_swarm_optimization(fitness_function, bounds, num_particles=100, max
         #     Image.fromarray((r.permute(1, 2, 0).numpy() * 255).astype(np.uint8)).save(save_path + f"_rendering_{i}.png")
 
         sample_images = torch.cat([rmbg_image.unsqueeze(0), renderings.to('cuda')], dim=0)
-
         if save_path is not None:
             Image.fromarray((renderings[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)).save(save_path + f"_1_after_large_sampling.png")
 
@@ -426,7 +425,7 @@ def particle_swarm_optimization(fitness_function, bounds, num_particles=100, max
             '''Concat with the initial samples, that is 1 + (num_samples - 1) = num_samples samples'''
             swarm = torch.cat([aligned_swarm, swarm[:num_particles-1]], dim=0)
         except:
-            print({'Dust3R' if not use_vggt else 'VGGT'} + 'failed to get a better initial guess, use the initial samples')
+            print(('Dust3R' if not use_vggt else 'VGGT') + ' failed to get a better initial guess, use the initial samples')
 
         scores, renderings = fitness_function(swarm, renderer)
 

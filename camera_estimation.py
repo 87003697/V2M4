@@ -1,15 +1,29 @@
-import os
-import sys
-import torch
-import numpy as np
+#!/usr/bin/env python3
+
+import pickle
 import argparse
+import numpy as np
 import imageio
-import trimesh
+import torch
+import os
 from PIL import Image
+from pathlib import Path
+import glob
+import cv2
+from typing import Dict, List, Optional
+
+# 导入现有的模块
+from v2m4_trellis.utils import render_utils
+from v2m4_trellis.utils.general_utils import *
+# 导入新的可视化模块
+from utils.visualization import CameraEstimationVisualizer
+from utils.loss_objective import create_loss_objective
+
+import sys
+import trimesh
 from datetime import datetime
 from natsort import natsorted, ns
 import utils3d
-from v2m4_trellis.utils import render_utils
 from v2m4_trellis.representations.mesh import MeshExtractResult
 from rembg import remove, new_session
 
@@ -285,6 +299,9 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # 创建可视化器实例
+    visualizer = CameraEstimationVisualizer(figsize=(15, 10))
+    
     log_progress("🚀 Starting Camera Search and Mesh Re-Pose Pipeline")
     log_progress(f"📁 Input directory: {args.input_dir}")
     log_progress(f"📁 Output directory: {args.output_dir}")
@@ -373,10 +390,19 @@ def main():
         )
         
         # Save alignment image
-        imageio.imsave(
-            os.path.join(args.output_dir, f"{base_name}_sample_mesh_align.png"),
-            rend_img
-        )
+        mesh_align_path = os.path.join(args.output_dir, f"{base_name}_sample_mesh_align.png")
+        imageio.imsave(mesh_align_path, rend_img)
+        
+        # Initialize frame data for visualization
+        frame_data = {
+            'frame_id': base_name,
+            'original': img_path,
+            'rmbg': rmbg_save_path,
+            'large_sampling': os.path.join(args.output_dir, f"{base_name}_1_after_large_sampling.png"),
+            'dust3r': os.path.join(args.output_dir, f"{base_name}_2_after_dust3r.png"),
+            'pso': os.path.join(args.output_dir, f"{base_name}_3_after_PSO.png"),
+            'final_align': mesh_align_path
+        }
         
         # Handle different model types
         if args.model != "TRELLIS":
@@ -387,10 +413,10 @@ def main():
                 params=params, 
                 use_vggt=args.use_vggt
             )
-            imageio.imsave(
-                os.path.join(args.output_dir, f"{base_name}_sample_genTex_align.png"),
-                rend_img
-            )
+            gentex_align_path = os.path.join(args.output_dir, f"{base_name}_sample_genTex_align.png")
+            imageio.imsave(gentex_align_path, rend_img)
+            # Update final align path to genTex version
+            frame_data['final_align'] = gentex_align_path
         
         log_progress("✅ Camera search and mesh re-pose completed")
         
@@ -439,6 +465,29 @@ def main():
         
         log_progress("✅ Re-canonicalization completed")
         
+        # 创建可视化
+        log_progress("🎨 Creating visualizations...")
+        
+        try:
+            # 只创建完整对比网格
+            grid_path = os.path.join(args.output_dir, f"{base_name}_comparison_grid.png")
+            visualizer.create_frame_comparison_grid(frame_data, grid_path)
+            log_progress(f"📊 Created comparison grid: {grid_path}")
+            
+            # 清理中间可视化文件
+            intermediate_files = [
+                os.path.join(args.output_dir, f"{base_name}_1_after_large_sampling.png"),
+                os.path.join(args.output_dir, f"{base_name}_2_after_dust3r.png"),
+                os.path.join(args.output_dir, f"{base_name}_3_after_PSO.png")
+            ]
+            for temp_file in intermediate_files:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    log_progress(f"🗑️ Cleaned up intermediate file: {os.path.basename(temp_file)}")
+            
+        except Exception as e:
+            log_progress(f"⚠️ Warning: Visualization failed for {base_name}: {e}")
+        
         # Store results
         outputs_list.append(outputs)
         extrinsics_list.append(extr)
@@ -458,6 +507,7 @@ def main():
     log_progress(f"📊 Processed {len(outputs_list)} meshes successfully")
     log_progress(f"📁 Results saved to: {args.output_dir}")
     log_progress(f"🎯 Loss objective used: {loss_objective.get_description()}")
+    log_progress("🎨 Comparison grid visualizations created for all processed frames")
 
 if __name__ == "__main__":
     main()
