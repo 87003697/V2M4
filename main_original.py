@@ -763,19 +763,45 @@ if __name__ == "__main__":
 
                 # ensure the foreground points in mask_tracks[i] are less equal than 10000 (otherwise OOM). For the points with more than 10000, randomly sample 10000 points by masking out the other points with mask value = 0
                 for i in range(nviews_track):
-                    if mask_tracks[i].sum() > 10000:
+                    # 处理可能的3D张量形状
+                    if mask_tracks[i].dim() == 3:
+                        mask_2d = mask_tracks[i].squeeze(0)
+                        is_3d = True
+                    else:
+                        mask_2d = mask_tracks[i]
+                        is_3d = False
+                    
+                    if mask_2d.sum() > 10000:
                         # Get indices of nonzero elements
-                        nonzero_indices = torch.nonzero(mask_tracks[i]).squeeze()
+                        nonzero_indices = torch.nonzero(mask_2d).squeeze()
                         # Randomly select 10000 indices from nonzero indices
                         selected_indices = nonzero_indices[torch.randperm(len(nonzero_indices))[:10000]]
                         # Create new mask with only selected indices set to 1
-                        new_mask = torch.zeros_like(mask_tracks[i])
+                        new_mask = torch.zeros_like(mask_2d)
                         new_mask[selected_indices[:, 0], selected_indices[:, 1]] = 1
-                        mask_tracks[i] = new_mask
+                        
+                        # 根据原始形状更新mask_tracks
+                        if is_3d:
+                            mask_tracks[i] = new_mask.unsqueeze(0)
+                        else:
+                            mask_tracks[i] = new_mask
 
                 # filter out points with mask_track == 0
                 for i in range(nviews_track):
-                    uv_tracking_points[i] = uv_tracking_points[i][mask_tracks[i] > 0]
+                    # 处理可能的3D张量形状 [1, H, W] 或 [H, W]
+                    if mask_tracks[i].dim() == 3:
+                        # 如果是3D张量，取第一个维度 [1, H, W] -> [H, W]
+                        mask_2d = mask_tracks[i].squeeze(0)
+                        H, W = mask_2d.shape
+                        uv_reshaped = uv_tracking_points[i].reshape(H * W, 3)
+                        mask_flattened = mask_2d.flatten()
+                    else:
+                        # 如果是2D张量 [H, W]
+                        H, W = mask_tracks[i].shape
+                        uv_reshaped = uv_tracking_points[i].reshape(H * W, 3)
+                        mask_flattened = mask_tracks[i].flatten()
+                    
+                    uv_tracking_points[i] = uv_reshaped[mask_flattened > 0]
 
                 for i in range(0, len(outputs_list)):
                     observations_target_all_track = render_utils.render_multiview_gradient(outputs_list[i]['mesh'][0], resolution=512, nviews=nviews_track, init_extrinsics=extrinsics_list[0], random_indices=[iid for iid in range(nviews_track)], return_type='color', input_intr_extrincs=(intr_track, extr_track))
@@ -795,10 +821,16 @@ if __name__ == "__main__":
                 max_frames_per_chunk = 32  # Adjust based on GPU memory to avoud OOM
                 for i in range(nviews_track):
                     # query points are the foreground points (value = 1) in the mask_track[i]
-                    queries = torch.nonzero(mask_tracks[i], as_tuple=False).float().cuda()
+                    # 确保使用2D mask
+                    if mask_tracks[i].dim() == 3:
+                        mask_2d = mask_tracks[i].squeeze(0)
+                    else:
+                        mask_2d = mask_tracks[i]
+                    
+                    queries = torch.nonzero(mask_2d, as_tuple=False).float().cuda()
                     # flip the x and y coordinates as cotracker query format is W, H
                     queries = queries.flip(1)
-                    queries = torch.cat([torch.zeros_like(queries[:, :1]), queries], dim=1)  # add the fixed frame 
+                    queries = torch.cat([torch.zeros_like(queries[:, :1]), queries], dim=1)  # add the fixed frame
 
                     # Initialize results
                     num_frames = track_video[i].shape[1]
