@@ -15,9 +15,10 @@ from typing import Dict, List, Optional
 # 导入现有的模块
 from v2m4_trellis.utils import render_utils
 from v2m4_trellis.utils.general_utils import *
-# 导入新的可视化模块
+# 导入新的可视化模块和预处理管道
 from utils.visualization import CameraEstimationVisualizer
 from utils.loss_objective import create_loss_objective
+from v2m4_trellis.pipelines import TrellisImageTo3DPipeline
 
 import sys
 import trimesh
@@ -25,7 +26,8 @@ from datetime import datetime
 from natsort import natsorted, ns
 import utils3d
 from v2m4_trellis.representations.mesh import MeshExtractResult
-from rembg import remove, new_session
+# 移除 rembg 导入，使用 TrellisImageTo3DPipeline 预处理
+# from rembg import remove, new_session
 
 # Import our custom loss objectives
 from utils.loss_objective import create_loss_objective, list_loss_objectives
@@ -36,22 +38,23 @@ def log_progress(message):
     print(f"[{timestamp}] {message}")
     sys.stdout.flush()
 
-def simple_rembg(image):
-    """Simple background removal using rembg"""
-    # Create rembg session
-    session = new_session()
-    # Remove background - this returns RGBA
-    result = remove(image, session=session)
-    
-    # Convert RGBA to RGB with white background
-    if result.mode == 'RGBA':
-        # Create white background
-        white_bg = Image.new('RGB', result.size, (255, 255, 255))
-        # Paste the RGBA image onto white background
-        white_bg.paste(result, mask=result.split()[-1])  # Use alpha channel as mask
-        result = white_bg
-    
-    return result
+# 移除 simple_rmbg 函数，使用 TrellisImageTo3DPipeline.preprocess_image 代替
+# def simple_rmbg(image):
+#     """Simple background removal using rembg"""
+#     # Create rembg session
+#     session = new_session()
+#     # Remove background - this returns RGBA
+#     result = remove(image, session=session)
+#     
+#     # Convert RGBA to RGB with white background
+#     if result.mode == 'RGBA':
+#         # Create white background
+#         white_bg = Image.new('RGB', result.size, (255, 255, 255))
+#         # Paste the RGBA image onto white background
+#         white_bg.paste(result, mask=result.split()[-1])  # Use alpha channel as mask
+#         result = white_bg
+#     
+#     return result
 
 def load_glb_to_mesh_extract_result(glb_path):
     """
@@ -364,12 +367,34 @@ def main():
         img_path = os.path.join(args.source_images_dir, img_file)
         image = Image.open(img_path)
         
-        # Simple background removal
-        rmbg_image = simple_rembg(image)
-        
-        # Save preprocessed image
-        rmbg_save_path = os.path.join(args.output_dir, f"{base_name}_rmbg.png")
-        rmbg_image.save(rmbg_save_path)
+        # 使用与 main_original.py 一致的预处理方法
+        if args.model == "Hunyuan":
+            log_progress("📸 Starting image preprocessing...")
+            cropped_image, rmbg_image = TrellisImageTo3DPipeline.preprocess_image(image, return_rgba=True)
+            # 保存预处理图像
+            rmbg_save_path = os.path.join(args.output_dir, f"{base_name}_rmbg.png")
+            cropped_save_path = os.path.join(args.output_dir, f"{base_name}_cropped.png")
+            rmbg_image.save(rmbg_save_path)
+            cropped_image.save(cropped_save_path)
+            log_progress("📸 Image preprocessing completed")
+        elif args.model in ["TripoSG", "Craftsman"]:
+            log_progress("📸 Starting image preprocessing...")
+            cropped_image, rmbg_image_rgba, rmbg_image = TrellisImageTo3DPipeline.preprocess_image(image, return_all_rbga=True)
+            # 保存预处理图像
+            rmbg_save_path = os.path.join(args.output_dir, f"{base_name}_rmbg.png")
+            cropped_save_path = os.path.join(args.output_dir, f"{base_name}_cropped.png")
+            rmbg_image.save(rmbg_save_path)
+            cropped_image.save(cropped_save_path)
+            log_progress("📸 Image preprocessing completed")
+        else:  # TRELLIS
+            log_progress("📸 Starting image preprocessing...")
+            cropped_image, rmbg_image = TrellisImageTo3DPipeline.preprocess_image(image)
+            # 保存预处理图像
+            rmbg_save_path = os.path.join(args.output_dir, f"{base_name}_rmbg.png")
+            cropped_save_path = os.path.join(args.output_dir, f"{base_name}_cropped.png")
+            rmbg_image.save(rmbg_save_path)
+            cropped_image.save(cropped_save_path)
+            log_progress("📸 Image preprocessing completed")
         
         # Create outputs dictionary
         outputs = {
@@ -398,6 +423,7 @@ def main():
             'frame_id': base_name,
             'original': img_path,
             'rmbg': rmbg_save_path,
+            'cropped': cropped_save_path,  # 添加裁剪后的图像路径
             'large_sampling': os.path.join(args.output_dir, f"{base_name}_1_after_large_sampling.png"),
             'dust3r': os.path.join(args.output_dir, f"{base_name}_2_after_dust3r.png"),
             'pso': os.path.join(args.output_dir, f"{base_name}_3_after_PSO.png"),

@@ -32,7 +32,7 @@ class CameraEstimationVisualizer:
         # 定义布局和标题
         layout = [
             (0, 0, 'original', 'Original Image'),
-            (0, 1, 'rmbg', 'Background Removed'),
+            (0, 1, 'cropped', 'Cropped & RMBG'),  # 优先显示裁剪后的图像
             (0, 2, 'large_sampling', 'Large Sampling'),
             (1, 0, 'dust3r', 'Dust3R Init'),
             (1, 1, 'pso', 'PSO Result'),
@@ -41,6 +41,10 @@ class CameraEstimationVisualizer:
         
         for row, col, key, title in layout:
             ax = axes[row, col]
+            
+            # 如果 cropped 不存在，fallback 到 rmbg
+            if key == 'cropped' and (key not in frame_data or not os.path.exists(frame_data.get(key, ''))):
+                key = 'rmbg'
             
             if key in frame_data and frame_data[key] is not None:
                 if isinstance(frame_data[key], str) and os.path.exists(frame_data[key]):
