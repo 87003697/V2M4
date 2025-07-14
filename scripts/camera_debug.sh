@@ -5,8 +5,8 @@ CUDA_VISIBLE_DEVICES=3 python camera_estimation.py \
     --input_dir ./results_examples/tmp \
     --output_dir ./test_visualization_final \
     --source_images_dir ./examples3/tmp \
-    --model Hunyuan \
-    --loss_type dreamsim \
+    --model TRELLIS \
+    --loss_type ssim \
     --max_samples 3
 
 echo "🎨 Visualization files generated!"

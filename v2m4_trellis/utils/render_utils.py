@@ -398,6 +398,7 @@ def particle_swarm_optimization(fitness_function, bounds, num_particles=100, max
             swarm = torch.cat([prior_params.unsqueeze(0), swarm], dim=0)
 
         scores, _ = fitness_function(swarm, renderer)
+        print(f"DEBUG: scores shape: {scores.shape}, num_particles: {num_particles}")
         _, top_indices = torch.topk(scores, num_particles, largest=False)  
         swarm = swarm[top_indices]
 

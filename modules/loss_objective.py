@@ -176,11 +176,18 @@ class SSIMLoss(LossObjective):
         C1 = 0.01 ** 2
         C2 = 0.03 ** 2
         
-        # Create Gaussian kernel
+        # Create 2D Gaussian kernel
         sigma = 1.5
-        kernel = torch.exp(-torch.linspace(-(window_size // 2), window_size // 2, window_size) ** 2 / (2 * sigma ** 2))
-        kernel = kernel / kernel.sum()
-        kernel = kernel.unsqueeze(0).unsqueeze(0)
+        # Create 1D Gaussian kernel
+        kernel_1d = torch.exp(-torch.linspace(-(window_size // 2), window_size // 2, window_size) ** 2 / (2 * sigma ** 2))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        
+        # Create 2D Gaussian kernel by outer product
+        kernel_2d = kernel_1d.unsqueeze(0) * kernel_1d.unsqueeze(1)
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        
+        # Add batch and channel dimensions: [out_channels, in_channels, height, width]
+        kernel = kernel_2d.unsqueeze(0).unsqueeze(0)
         kernel = kernel.to(img1.device)
         
         # Compute local means

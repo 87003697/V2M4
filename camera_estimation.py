@@ -212,7 +212,7 @@ def find_closet_camera_pos_with_custom_loss(sample, rmbg_image, loss_objective, 
                 pts3d.append(res['points3Dpos'].detach().cpu())
         
         renderings = torch.stack(renderings)
-        losses = torch.stack(losses)  # Use stack instead of cat for scalar tensors
+        losses = torch.stack(losses).squeeze()  # Use stack and squeeze for proper shape
         
         if return_more:
             return losses, renderings, extr, intr, torch.cat(pts3d)
@@ -222,7 +222,7 @@ def find_closet_camera_pos_with_custom_loss(sample, rmbg_image, loss_objective, 
     
     # Coarse optimization with PSO using custom loss
     coarse_params = particle_swarm_optimization(
-        fitness_batch_custom, None, rmbg_image=rmbg_image, renderer=renderer, 
+        fitness_batch_custom, None, num_particles=100, init_samples=1000, rmbg_image=rmbg_image, renderer=renderer, 
         prior_params=prior_params, save_path=save_path, is_Hunyuan=is_Hunyuan, use_vggt=use_vggt
     )
     yaw, pitch, r, lookat_x, lookat_y, lookat_z = coarse_params
