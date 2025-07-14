@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import imageio
 
 # 设置环境变量
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 def load_test_image(image_path):
     """加载测试图像"""

@@ -76,9 +76,43 @@ def load_glb_to_mesh_extract_result(glb_path):
     faces = torch.tensor(actual_mesh.faces, dtype=torch.int64).cuda()
     
     # Extract vertex attributes (colors + normals)
+    vertex_colors = None
+    
+    # 优先使用顶点颜色
     if hasattr(actual_mesh.visual, 'to_color'):
-        vertex_colors = torch.tensor(actual_mesh.visual.to_color().vertex_colors[..., :3], dtype=torch.float32).cuda() / 255.0
-    else:
+        try:
+            vertex_colors = torch.tensor(actual_mesh.visual.to_color().vertex_colors[..., :3], dtype=torch.float32).cuda() / 255.0
+        except:
+            vertex_colors = None
+    
+    # 如果没有顶点颜色，尝试使用面颜色
+    if vertex_colors is None and hasattr(actual_mesh.visual, 'face_colors'):
+        print("🎨 Converting face colors to vertex colors...")
+        face_colors = actual_mesh.visual.face_colors
+        
+        # 将面颜色转换为顶点颜色
+        vertex_colors_np = np.zeros((len(actual_mesh.vertices), 3), dtype=np.float32)
+        vertex_count = np.zeros(len(actual_mesh.vertices), dtype=np.int32)
+        
+        # 对每个面，将其颜色累加到对应的顶点
+        for face_idx, face in enumerate(actual_mesh.faces):
+            face_color = face_colors[face_idx][:3].astype(np.float32) / 255.0  # 转换为[0,1]范围
+            for vertex_idx in face:
+                vertex_colors_np[vertex_idx] += face_color
+                vertex_count[vertex_idx] += 1
+        
+        # 对每个顶点，计算平均颜色
+        for i in range(len(vertex_colors_np)):
+            if vertex_count[i] > 0:
+                vertex_colors_np[i] /= vertex_count[i]
+            else:
+                vertex_colors_np[i] = np.array([0.5, 0.5, 0.5])  # 默认灰色
+        
+        vertex_colors = torch.tensor(vertex_colors_np, dtype=torch.float32).cuda()
+        print(f"✅ Converted face colors to vertex colors. Color range: [{vertex_colors.min().item():.3f}, {vertex_colors.max().item():.3f}]")
+    
+    # 如果还是没有颜色，使用默认灰色
+    if vertex_colors is None:
         vertex_colors = torch.ones((vertices.shape[0], 3), dtype=torch.float32).cuda() * 0.5
     
     # Compute vertex normals if not available
